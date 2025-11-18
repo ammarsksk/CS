@@ -1,6 +1,4 @@
-// threads.c - Blind Secret Name Network
-// Features: No Global List, Blind Requests, Strict Privacy
-// Compile: make -B
+//BLIND
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,11 +15,11 @@
 #include <openssl/err.h>
 
 #define SERVER_PORT  5432
-#define MAX_PENDING  5      // <--- This was missing!
+#define MAX_PENDING  5     
 #define MAX_LINE     1024
 #define MAX_CLIENTS  10
 
-// --- Relationship States ---
+// Relationship States
 #define REL_NONE      0
 #define REL_REQ_SENT  1
 #define REL_REQ_RCVD  2
@@ -31,16 +29,16 @@ typedef struct {
     int id;
     int socket;
     SSL *ssl;
-    char name[32];
+    char name[32]; 
     int active; // 0 = empty, 1 = active
 } Client;
 
-// Global State
+// global state - friends is an adjacency matrix
 Client clients[MAX_CLIENTS];
-int friends[MAX_CLIENTS][MAX_CLIENTS]; // Matrix: [UserA][UserB] = Status
+int friends[MAX_CLIENTS][MAX_CLIENTS];
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
-// --- OpenSSL Helpers ---
+// initialises ssl
 void init_openssl() {
     SSL_load_error_strings();
     OpenSSL_add_ssl_algorithms();
@@ -50,6 +48,7 @@ void cleanup_openssl() {
     EVP_cleanup();
 }
 
+//ssl context
 SSL_CTX *create_context() {
     const SSL_METHOD *method;
     SSL_CTX *ctx;
@@ -62,7 +61,7 @@ SSL_CTX *create_context() {
     }
     return ctx;
 }
-
+//load security creds
 void configure_context(SSL_CTX *ctx, const char *pemfile) {
     if (SSL_CTX_use_certificate_file(ctx, pemfile, SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
@@ -73,15 +72,13 @@ void configure_context(SSL_CTX *ctx, const char *pemfile) {
         exit(EXIT_FAILURE);
     }
 }
-
-// --- Logic Helpers ---
-
+//helper to send msgs
 void send_msg(int idx, char *msg) {
     if (clients[idx].active && clients[idx].ssl) {
         SSL_write(clients[idx].ssl, msg, strlen(msg));
     }
 }
-
+//finds client by secret name
 int find_user_by_name(char *name) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].active && strcmp(clients[i].name, name) == 0) {
@@ -90,7 +87,7 @@ int find_user_by_name(char *name) {
     }
     return -1;
 }
-
+//cleanup process
 void cleanup_client(int idx) {
     if (clients[idx].active) {
         for(int i=0; i<MAX_CLIENTS; i++) {
@@ -107,8 +104,7 @@ void cleanup_client(int idx) {
     }
 }
 
-// --- Thread Worker ---
-
+// thread worker fn. 
 void *client_handler(void *arg) {
     int idx = *(int *)arg;
     free(arg);
@@ -117,7 +113,7 @@ void *client_handler(void *arg) {
     char buf[MAX_LINE];
     char out[MAX_LINE];
 
-    // 1. Registration
+    // registration
     char *ask_name = "Enter your SECRET NAME to join the network: ";
     SSL_write(ssl, ask_name, strlen(ask_name));
 
@@ -138,11 +134,11 @@ void *client_handler(void *arg) {
     strncpy(clients[idx].name, buf, 31);
     pthread_mutex_unlock(&lock);
 
-    sprintf(out, "Welcome, %s. Network is BLIND. Use /chat [name] to request a connection.\n", clients[idx].name);
+    sprintf(out, "Welcome, %s. to BLIND. Use /chat [name] to request a connection.\n", clients[idx].name);
     SSL_write(ssl, out, strlen(out));
     printf("User registered: %s (Slot %d)\n", clients[idx].name, idx);
 
-    // 2. Main Loop
+    // main Loop
     while (1) {
         bytes = SSL_read(ssl, buf, sizeof(buf)-1);
         if (bytes <= 0) {
@@ -158,7 +154,7 @@ void *client_handler(void *arg) {
 
         pthread_mutex_lock(&lock);
 
-        // --- COMMAND: /list (ONLY Accepted Friends) ---
+        // /list ocmmand
         if (strcmp(buf, "/list") == 0) {
             char list[MAX_LINE] = "Your Private Contacts: ";
             int found = 0;
@@ -174,7 +170,7 @@ void *client_handler(void *arg) {
             send_msg(idx, list);
         }
 
-        // --- COMMAND: /chat [name] (Blind Request) ---
+        // /chat [name] command
         else if (strncmp(buf, "/chat ", 6) == 0) {
             char *target_name = buf + 6;
             int t_idx = find_user_by_name(target_name);
@@ -197,7 +193,7 @@ void *client_handler(void *arg) {
             }
         }
 
-        // --- COMMAND: /accept [name] ---
+        // /accept [name] command
         else if (strncmp(buf, "/accept ", 8) == 0) {
             char *target_name = buf + 8;
             int t_idx = find_user_by_name(target_name);
@@ -214,7 +210,7 @@ void *client_handler(void *arg) {
             }
         }
 
-        // --- PRIVATE MESSAGING: @name msg ---
+        // @name msg
         else if (buf[0] == '@') {
             char *space = strchr(buf, ' ');
             if (space) {
@@ -244,7 +240,7 @@ void *client_handler(void *arg) {
     }
     return NULL;
 }
-
+//main entry point and control traffic
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <combined-pem-file>\n", argv[0]);
@@ -268,7 +264,6 @@ int main(int argc, char **argv) {
     if (bind(listener, (struct sockaddr *)&sin, sizeof(sin)) < 0) { perror("bind"); exit(1); }
     if (listen(listener, MAX_PENDING) < 0) { perror("listen"); exit(1); }
 
-    // Init Globals
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clients[i].active = 0;
         for (int j = 0; j < MAX_CLIENTS; j++) friends[i][j] = REL_NONE;
@@ -328,7 +323,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Admin (Restricted to /list)
+        // Server (only /list allowed)
         if (FD_ISSET(STDIN_FILENO, &readfds)) {
             if (fgets(input_buf, sizeof(input_buf), stdin)) {
                 input_buf[strcspn(input_buf, "\n")] = 0;
