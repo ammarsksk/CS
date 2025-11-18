@@ -1,5 +1,5 @@
-// threads.c - Advanced Chat Server
-// Features: Broadcast, Private (@id), Server Commands, /list, /myid
+// threads.c - Blind Secret Name Network
+// Features: No Global List, Blind Requests, Strict Privacy
 // Compile: make -B
 
 #include <stdio.h>
@@ -17,13 +17,27 @@
 #include <openssl/err.h>
 
 #define SERVER_PORT  5432
-#define MAX_PENDING  5
+#define MAX_PENDING  5      // <--- This was missing!
 #define MAX_LINE     1024
 #define MAX_CLIENTS  10
 
+// --- Relationship States ---
+#define REL_NONE      0
+#define REL_REQ_SENT  1
+#define REL_REQ_RCVD  2
+#define REL_FRIENDS   3
+
+typedef struct {
+    int id;
+    int socket;
+    SSL *ssl;
+    char name[32];
+    int active; // 0 = empty, 1 = active
+} Client;
+
 // Global State
-int client_socks[MAX_CLIENTS];   
-SSL *client_ssl[MAX_CLIENTS];    
+Client clients[MAX_CLIENTS];
+int friends[MAX_CLIENTS][MAX_CLIENTS]; // Matrix: [UserA][UserB] = Status
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 // --- OpenSSL Helpers ---
@@ -60,54 +74,37 @@ void configure_context(SSL_CTX *ctx, const char *pemfile) {
     }
 }
 
-// --- Chat Logic Helpers ---
+// --- Logic Helpers ---
 
-void cleanup_client_slot(int idx) {
-    if (client_ssl[idx]) {
-        SSL_shutdown(client_ssl[idx]);
-        SSL_free(client_ssl[idx]);
-        client_ssl[idx] = NULL;
-    }
-    if (client_socks[idx] != -1) {
-        close(client_socks[idx]);
-        client_socks[idx] = -1;
+void send_msg(int idx, char *msg) {
+    if (clients[idx].active && clients[idx].ssl) {
+        SSL_write(clients[idx].ssl, msg, strlen(msg));
     }
 }
 
-// Send a message to a specific client ID (Thread Safe)
-void send_private_message(int target_idx, char *msg) {
-    pthread_mutex_lock(&lock);
-    if (target_idx >= 0 && target_idx < MAX_CLIENTS && client_ssl[target_idx] != NULL) {
-        SSL_write(client_ssl[target_idx], msg, strlen(msg));
-    }
-    pthread_mutex_unlock(&lock);
-}
-
-// Send to everyone EXCEPT sender (Thread Safe)
-void broadcast_message(char *msg, int sender_idx) {
-    pthread_mutex_lock(&lock);
+int find_user_by_name(char *name) {
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (client_ssl[i] != NULL && i != sender_idx) {
-            SSL_write(client_ssl[i], msg, strlen(msg));
+        if (clients[i].active && strcmp(clients[i].name, name) == 0) {
+            return i;
         }
     }
-    pthread_mutex_unlock(&lock);
+    return -1;
 }
 
-void send_user_list(int requester_idx) {
-    char list_msg[MAX_LINE] = "Active Clients: ";
-    char temp[16];
-    
-    pthread_mutex_lock(&lock);
-    for(int i=0; i<MAX_CLIENTS; i++) {
-        if (client_ssl[i] != NULL) {
-            sprintf(temp, "[%d] ", i);
-            strcat(list_msg, temp);
+void cleanup_client(int idx) {
+    if (clients[idx].active) {
+        for(int i=0; i<MAX_CLIENTS; i++) {
+            friends[idx][i] = REL_NONE;
+            friends[i][idx] = REL_NONE;
         }
+        if (clients[idx].ssl) {
+            SSL_shutdown(clients[idx].ssl);
+            SSL_free(clients[idx].ssl);
+        }
+        close(clients[idx].socket);
+        clients[idx].active = 0;
+        memset(clients[idx].name, 0, 32);
     }
-    pthread_mutex_unlock(&lock);
-    strcat(list_msg, "\n");
-    send_private_message(requester_idx, list_msg);
 }
 
 // --- Thread Worker ---
@@ -116,72 +113,137 @@ void *client_handler(void *arg) {
     int idx = *(int *)arg;
     free(arg);
     
-    SSL *ssl = client_ssl[idx];
+    SSL *ssl = clients[idx].ssl;
     char buf[MAX_LINE];
-    char outgoing[MAX_LINE + 50];
+    char out[MAX_LINE];
 
-    // --- NEW: Send Welcome Message with ID ---
-    char welcome[100];
-    snprintf(welcome, sizeof(welcome), "Connected securely. You are Client ID: %d\n", idx);
-    SSL_write(ssl, welcome, strlen(welcome));
-    // -----------------------------------------
+    // 1. Registration
+    char *ask_name = "Enter your SECRET NAME to join the network: ";
+    SSL_write(ssl, ask_name, strlen(ask_name));
 
+    int bytes = SSL_read(ssl, buf, sizeof(buf)-1);
+    if (bytes <= 0) { cleanup_client(idx); return NULL; }
+    
+    buf[bytes] = '\0';
+    buf[strcspn(buf, "\n")] = 0; 
+    
+    pthread_mutex_lock(&lock);
+    if (find_user_by_name(buf) != -1) {
+        char *taken = "Name taken. Bye.\n";
+        SSL_write(ssl, taken, strlen(taken));
+        cleanup_client(idx);
+        pthread_mutex_unlock(&lock);
+        return NULL;
+    }
+    strncpy(clients[idx].name, buf, 31);
+    pthread_mutex_unlock(&lock);
+
+    sprintf(out, "Welcome, %s. Network is BLIND. Use /chat [name] to request a connection.\n", clients[idx].name);
+    SSL_write(ssl, out, strlen(out));
+    printf("User registered: %s (Slot %d)\n", clients[idx].name, idx);
+
+    // 2. Main Loop
     while (1) {
-        int bytes = SSL_read(ssl, buf, sizeof(buf)-1);
+        bytes = SSL_read(ssl, buf, sizeof(buf)-1);
         if (bytes <= 0) {
-            printf("Client %d disconnected.\n", idx);
+            printf("User %s disconnected.\n", clients[idx].name);
             pthread_mutex_lock(&lock);
-            cleanup_client_slot(idx);
+            cleanup_client(idx);
             pthread_mutex_unlock(&lock);
             break;
         } 
         
         buf[bytes] = '\0';
-        buf[strcspn(buf, "\n")] = 0; // Trim newline
+        buf[strcspn(buf, "\n")] = 0;
 
-        // 1. Check for Private Message: "@<id> <msg>"
-        if (buf[0] == '@') {
-            char *space_ptr = strchr(buf, ' ');
-            if (space_ptr) {
-                *space_ptr = '\0'; 
-                char *target_str = buf + 1; 
-                char *msg_content = space_ptr + 1;
+        pthread_mutex_lock(&lock);
 
-                if (strcasecmp(target_str, "server") == 0) {
-                    printf("[Private from Client %d]: %s\n", idx, msg_content);
-                } 
-                else {
-                    int target_id = atoi(target_str);
-                    snprintf(outgoing, sizeof(outgoing), "[Private from %d]: %s\n", idx, msg_content);
-                    send_private_message(target_id, outgoing);
-                    printf("[Log] Client %d -> Client %d (Private)\n", idx, target_id);
+        // --- COMMAND: /list (ONLY Accepted Friends) ---
+        if (strcmp(buf, "/list") == 0) {
+            char list[MAX_LINE] = "Your Private Contacts: ";
+            int found = 0;
+            for (int i=0; i<MAX_CLIENTS; i++) {
+                if (friends[idx][i] == REL_FRIENDS) {
+                    strcat(list, clients[i].name);
+                    strcat(list, " ");
+                    found = 1;
                 }
+            }
+            if (!found) strcat(list, "(None. Use /chat [name] to add someone)");
+            strcat(list, "\n");
+            send_msg(idx, list);
+        }
+
+        // --- COMMAND: /chat [name] (Blind Request) ---
+        else if (strncmp(buf, "/chat ", 6) == 0) {
+            char *target_name = buf + 6;
+            int t_idx = find_user_by_name(target_name);
+
+            if (t_idx == -1) {
+                send_msg(idx, "User not found or not online.\n");
+            } else if (t_idx == idx) {
+                send_msg(idx, "You cannot chat with yourself.\n");
+            } else if (friends[idx][t_idx] == REL_FRIENDS) {
+                send_msg(idx, "Already friends!\n");
+            } else if (friends[idx][t_idx] == REL_REQ_SENT) {
+                send_msg(idx, "Request already pending.\n");
             } else {
-                char *err = "Usage: @<id> <message>\n";
-                SSL_write(ssl, err, strlen(err));
+                friends[idx][t_idx] = REL_REQ_SENT;
+                friends[t_idx][idx] = REL_REQ_RCVD;
+                
+                send_msg(idx, "Request sent. Waiting for them to accept.\n");
+                sprintf(out, "New Chat Request from '%s'. Type '/accept %s' to connect.\n", clients[idx].name, clients[idx].name);
+                send_msg(t_idx, out);
             }
         }
-        // 2. Command: /list
-        else if (strcmp(buf, "/list") == 0) {
-            send_user_list(idx);
+
+        // --- COMMAND: /accept [name] ---
+        else if (strncmp(buf, "/accept ", 8) == 0) {
+            char *target_name = buf + 8;
+            int t_idx = find_user_by_name(target_name);
+
+            if (t_idx != -1 && friends[idx][t_idx] == REL_REQ_RCVD) {
+                friends[idx][t_idx] = REL_FRIENDS;
+                friends[t_idx][idx] = REL_FRIENDS;
+                
+                send_msg(idx, "Connected! You can now private message.\n");
+                sprintf(out, "%s accepted your request. You can now private message.\n", clients[idx].name);
+                send_msg(t_idx, out);
+            } else {
+                send_msg(idx, "No pending request from that user.\n");
+            }
         }
-        // 3. NEW Command: /myid
-        else if (strcmp(buf, "/myid") == 0) {
-            char id_msg[64];
-            snprintf(id_msg, sizeof(id_msg), "Your Client ID is: %d\n", idx);
-            SSL_write(ssl, id_msg, strlen(id_msg));
+
+        // --- PRIVATE MESSAGING: @name msg ---
+        else if (buf[0] == '@') {
+            char *space = strchr(buf, ' ');
+            if (space) {
+                *space = '\0';
+                char *target_name = buf + 1;
+                char *msg_content = space + 1;
+                int t_idx = find_user_by_name(target_name);
+
+                if (t_idx != -1) {
+                    if (friends[idx][t_idx] == REL_FRIENDS) {
+                        sprintf(out, "[%s]: %s\n", clients[idx].name, msg_content);
+                        send_msg(t_idx, out);
+                        send_msg(idx, "Sent.\n");
+                    } else {
+                        send_msg(idx, "Error: You are not connected with this user.\n");
+                    }
+                } else {
+                    send_msg(idx, "User not found.\n");
+                }
+            }
         }
-        // 4. Default: Broadcast
         else {
-            printf("Client %d says: %s\n", idx, buf);
-            snprintf(outgoing, sizeof(outgoing), "Client %d: %s\n", idx, buf);
-            broadcast_message(outgoing, idx);
+            send_msg(idx, "Unknown command. Use /chat [name], /accept [name], /list, or @name [msg].\n");
         }
+
+        pthread_mutex_unlock(&lock);
     }
     return NULL;
 }
-
-// --- Main Server Loop ---
 
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -200,25 +262,20 @@ int main(int argc, char **argv) {
     sin.sin_addr.s_addr = INADDR_ANY;
     sin.sin_port = htons(SERVER_PORT);
 
-    if ((listener = socket(PF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("socket failed"); exit(1);
-    }
+    if ((listener = socket(PF_INET, SOCK_STREAM, 0)) < 0) { perror("socket"); exit(1); }
     int opt = 1;
     setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    if (bind(listener, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
-        perror("bind failed"); exit(1);
-    }
-    if (listen(listener, MAX_PENDING) < 0) {
-        perror("listen failed"); exit(1);
-    }
+    if (bind(listener, (struct sockaddr *)&sin, sizeof(sin)) < 0) { perror("bind"); exit(1); }
+    if (listen(listener, MAX_PENDING) < 0) { perror("listen"); exit(1); }
 
+    // Init Globals
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        client_socks[i] = -1;
-        client_ssl[i] = NULL;
+        clients[i].active = 0;
+        for (int j = 0; j < MAX_CLIENTS; j++) friends[i][j] = REL_NONE;
     }
 
-    printf("Server running on port %d.\n", SERVER_PORT);
-    printf("COMMANDS: /list, /myid, @<id> <msg>, <broadcast>\n");
+    printf("Blind Private Network running on port %d.\n", SERVER_PORT);
+    printf("Admin restricted to /list.\n");
 
     fd_set readfds;
     int max_fd;
@@ -230,12 +287,8 @@ int main(int argc, char **argv) {
         FD_SET(STDIN_FILENO, &readfds);  
         max_fd = listener > STDIN_FILENO ? listener : STDIN_FILENO;
 
-        if (select(max_fd + 1, &readfds, NULL, NULL, NULL) < 0) {
-            perror("select error");
-            continue;
-        }
+        if (select(max_fd + 1, &readfds, NULL, NULL, NULL) < 0) continue;
 
-        // Handle New Connections
         if (FD_ISSET(listener, &readfds)) {
             struct sockaddr_in client_addr;
             socklen_t addr_len = sizeof(client_addr);
@@ -245,16 +298,16 @@ int main(int argc, char **argv) {
                 pthread_mutex_lock(&lock);
                 int slot = -1;
                 for (int i = 0; i < MAX_CLIENTS; i++) {
-                    if (client_socks[i] == -1) {
+                    if (!clients[i].active) {
                         slot = i;
-                        client_socks[i] = new_s;
+                        clients[i].socket = new_s;
+                        clients[i].active = 1; 
                         break;
                     }
                 }
                 pthread_mutex_unlock(&lock);
 
                 if (slot == -1) {
-                    printf("Server full.\n");
                     close(new_s);
                 } else {
                     SSL *ssl = SSL_new(ctx);
@@ -262,13 +315,9 @@ int main(int argc, char **argv) {
                     if (SSL_accept(ssl) <= 0) {
                         ERR_print_errors_fp(stderr);
                         close(new_s);
+                        clients[slot].active = 0;
                     } else {
-                        pthread_mutex_lock(&lock);
-                        client_ssl[slot] = ssl;
-                        pthread_mutex_unlock(&lock);
-                        
-                        printf("New Client connected at slot %d\n", slot);
-                        
+                        clients[slot].ssl = ssl;
                         pthread_t tid;
                         int *pidx = malloc(sizeof(int));
                         *pidx = slot;
@@ -279,26 +328,20 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Handle Server Admin Input
+        // Admin (Restricted to /list)
         if (FD_ISSET(STDIN_FILENO, &readfds)) {
             if (fgets(input_buf, sizeof(input_buf), stdin)) {
-                input_buf[strcspn(input_buf, "\n")] = 0; 
-                
-                if (input_buf[0] == '@') {
-                    char *space = strchr(input_buf, ' ');
-                    if (space) {
-                        *space = '\0';
-                        int target_id = atoi(input_buf + 1);
-                        char *msg = space + 1;
-                        char server_msg[MAX_LINE];
-                        snprintf(server_msg, sizeof(server_msg), "[Admin Private]: %s\n", msg);
-                        send_private_message(target_id, server_msg);
-                        printf("Sent private message to Client %d.\n", target_id);
+                input_buf[strcspn(input_buf, "\n")] = 0;
+                if (strcmp(input_buf, "/list") == 0) {
+                    printf("Active Clients: ");
+                    pthread_mutex_lock(&lock);
+                    for(int i=0; i<MAX_CLIENTS; i++) {
+                        if (clients[i].active) printf("[%s] ", clients[i].name);
                     }
+                    pthread_mutex_unlock(&lock);
+                    printf("\n");
                 } else {
-                    char server_broadcast[MAX_LINE];
-                    snprintf(server_broadcast, sizeof(server_broadcast), "[Admin Broadcast]: %s\n", input_buf);
-                    broadcast_message(server_broadcast, -1); 
+                    printf("Admin restricted to /list only.\n");
                 }
             }
         }
