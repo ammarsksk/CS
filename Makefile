@@ -12,4 +12,4 @@ client: client.c
 
 
 clean:
-	rm -f server client
+	rm -f server client threads
