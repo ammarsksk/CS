@@ -1,5 +1,5 @@
 
-default: client server threads
+default: client threads
 
 threads: threads.c
 	gcc -o threads threads.c -lssl -lcrypto -pthread
@@ -9,4 +9,4 @@ client: client.c
 
 
 clean:
-	rm -f server client threads
+	rm -f client threads
